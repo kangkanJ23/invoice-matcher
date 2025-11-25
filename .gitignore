@@ -37,3 +37,9 @@ uploads/
 .env
 *.db
 *.sqlite
+venv/
+invoice_matcher.db
+uploads/
+.env
+*.db
+*.sqlite
