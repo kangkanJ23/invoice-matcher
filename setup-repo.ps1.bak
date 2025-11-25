@@ -1,0 +1,270 @@
+<#
+setup-repo.ps1
+Safe, idempotent PowerShell repo housekeeping script for invoice-matcher.
+#>
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Write-Info([string]$m){ Write-Host "[INFO] $m" -ForegroundColor Cyan }
+function Write-Warn([string]$m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
+function Write-Err([string]$m){ Write-Host "[ERROR] $m" -ForegroundColor Red }
+
+if (-not (Test-Path .git)) {
+    Write-Err 'Not a git repo (no .git). Aborting.'
+    exit 1
+}
+
+Write-Info 'Current git branch:'; & git branch --show-current
+Write-Info "Running 'git status --porcelain'..."
+& git status --porcelain
+
+# single-quoted here-string to avoid interpolation
+$gitignoreContent = @'
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.sqlite3
+*.db
+*.sqlite
+
+# Virtualenvs
+venv/
+env/
+ENV/
+.venv/
+
+# Env files / secrets
+.env
+.env.*.local
+secrets.json
+
+# Runtime / uploads
+uploads/
+*.log
+
+# Node / frontend
+node_modules/
+dist/
+build/
+
+# IDEs / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+'@
+
+$writeGitignore = $true
+if (Test-Path '.gitignore') {
+    $existing = Get-Content .gitignore -Raw
+    if ($existing -eq $gitignoreContent) {
+        $writeGitignore = $false
+        Write-Info '.gitignore already up-to-date.'
+    }
+}
+
+if ($writeGitignore) {
+    Write-Info 'Writing recommended .gitignore'
+    $gitignoreContent | Out-File -FilePath .gitignore -Encoding utf8 -Force
+    & git add .gitignore
+}
+
+# Stop tracking runtime artifacts (keep local files)
+$toUntrack = @('venv','invoice_matcher.db','uploads')
+foreach ($item in $toUntrack) {
+    try {
+        & git ls-files --error-unmatch $item 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Info "Removing $item from git tracking..."
+            & git rm -r --cached $item 2>$null
+        } else {
+            Write-Info "$item is not tracked or doesn't exist — skipping"
+        }
+    } catch {
+        Write-Warn ("Could not check/remove {0}: {1}" -f $item, $_)
+    }
+}
+
+# Remove top-level alembic if present (prefer backend/alembic)
+if (Test-Path 'alembic' -PathType Container -ErrorAction SilentlyContinue) {
+    Write-Warn "Top-level 'alembic/' found. Deleting it to avoid duplication."
+    Remove-Item -Recurse -Force alembic 2>$null
+}
+if (Test-Path 'alembic.ini') { Remove-Item -Force alembic.ini 2>$null }
+
+# Move backend/docker-compose.yml to root if appropriate
+if (Test-Path 'backend\docker-compose.yml' -PathType Leaf) {
+    if (-not (Test-Path 'docker-compose.yml')) {
+        Write-Info 'Moving backend\docker-compose.yml to repo root'
+        Move-Item -Path 'backend\docker-compose.yml' -Destination 'docker-compose.yml' -Force
+        & git add docker-compose.yml
+    } else {
+        Write-Warn 'Both backend\docker-compose.yml and docker-compose.yml exist. Please reconcile manually.'
+    }
+}
+
+# Create docker-compose.yml at root if missing
+if (-not (Test-Path 'docker-compose.yml')) {
+    Write-Info 'Creating docker-compose.yml at repo root'
+    $compose = @'
+version: '3.8'
+services:
+  backend:
+    build: ./backend
+    ports:
+      - '8000:8000'
+    volumes:
+      - ./backend:/app
+    env_file:
+      - ./backend/.env
+  frontend:
+    build: ./frontend
+    ports:
+      - '3000:80'
+'@
+    $compose | Out-File -FilePath 'docker-compose.yml' -Encoding utf8 -Force
+    & git add docker-compose.yml
+} else {
+    Write-Info 'docker-compose.yml already exists at repo root — leaving it.'
+}
+
+# Create backend Dockerfile if missing
+if (-not (Test-Path 'backend\Dockerfile')) {
+    Write-Info 'Creating backend\Dockerfile'
+    $backendDocker = @'
+FROM python:3.11-slim
+WORKDIR /app
+COPY backend/requirements.txt /app/requirements.txt
+RUN pip install --upgrade pip && if [ -f /app/requirements.txt ]; then pip install -r /app/requirements.txt; fi
+COPY backend /app
+ENV PYTHONUNBUFFERED=1
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+'@
+    $backendDocker | Out-File -FilePath 'backend\Dockerfile' -Encoding utf8 -Force
+    & git add 'backend\Dockerfile'
+} else {
+    Write-Info 'backend\Dockerfile already exists'
+}
+
+# Create frontend Dockerfile if missing
+if (-not (Test-Path 'frontend\Dockerfile')) {
+    Write-Info 'Creating frontend\Dockerfile'
+    $frontendDocker = @'
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+FROM nginx:stable-alpine
+COPY --from=builder /app/build /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+'@
+    $frontendDocker | Out-File -FilePath 'frontend\Dockerfile' -Encoding utf8 -Force
+    & git add 'frontend\Dockerfile'
+} else {
+    Write-Info 'frontend\Dockerfile already exists'
+}
+
+# Create workflows directory if needed
+if (-not (Test-Path '.github\workflows')) { New-Item -ItemType Directory -Path '.github\workflows' -Force | Out-Null }
+
+$backendWorkflow = '.github\workflows\ci-backend.yml'
+if (-not (Test-Path $backendWorkflow)) {
+    Write-Info "Creating $backendWorkflow"
+    $bw = @'
+name: CI - Backend
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; fi
+      - name: Run tests
+        run: |
+          pytest -q backend/tests || true
+'@
+    $bw | Out-File -FilePath $backendWorkflow -Encoding utf8 -Force
+    & git add $backendWorkflow
+} else { Write-Info "$backendWorkflow exists — skipping" }
+
+$frontendWorkflow = '.github\workflows\ci-frontend.yml'
+if (-not (Test-Path $frontendWorkflow)) {
+    Write-Info "Creating $frontendWorkflow"
+    $fw = @'
+name: CI - Frontend
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install & Build
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build --silent
+'@
+    $fw | Out-File -FilePath $frontendWorkflow -Encoding utf8 -Force
+    & git add $frontendWorkflow
+} else { Write-Info "$frontendWorkflow exists — skipping" }
+
+# Create basic backend test if missing
+if (-not (Test-Path 'backend\tests\test_health.py')) {
+    Write-Info 'Creating backend/tests/test_health.py'
+    New-Item -ItemType Directory -Path 'backend\tests' -Force | Out-Null
+    $test = @'
+from fastapi.testclient import TestClient
+from app.main import app
+
+client = TestClient(app)
+
+def test_health():
+    res = client.get('/health')
+    assert res.status_code in (200, 404)
+'@
+    $test | Out-File -FilePath 'backend\tests\test_health.py' -Encoding utf8 -Force
+    & git add 'backend\tests\test_health.py'
+} else {
+    Write-Info 'backend/tests/test_health.py already exists'
+}
+
+# Stage backend alembic if present
+if (Test-Path 'backend\alembic.ini') { & git add 'backend\alembic.ini' }
+if (Test-Path 'backend\alembic') { & git add -A 'backend\alembic\' }
+
+# Commit and push if staged changes exist
+$staged = (& git diff --cached --name-only) -join "`n"
+if ($staged) {
+    Write-Info "Files staged for commit:`n$staged"
+    $commitMessage = 'Repo housekeeping: .gitignore, untrack runtime artifacts, dockerfiles, CI, tests'
+    & git commit -m $commitMessage
+    try {
+        & git push
+        Write-Info 'Pushed changes to remote.'
+    } catch {
+        Write-Warn 'Push failed; commit is local. Resolve git remote/auth issues and push manually.'
+    }
+} else {
+    Write-Info 'No changes staged for commit. Nothing to push.'
+}
+
+Write-Info 'Final git status:'; & git status --porcelain
+Write-Info 'Files tracked that match venv|invoice_matcher.db|uploads (should be none):'
+& git ls-files | Select-String 'venv|invoice_matcher.db|uploads' | ForEach-Object { Write-Host $_.Line }
+
+Write-Info 'Done. Review created files and adjust as needed.'
