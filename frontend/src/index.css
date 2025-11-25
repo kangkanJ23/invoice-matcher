@@ -1,0 +1,4 @@
+/* minimal resets — Tailwind CDN provides utilities */
+html,body,#root { height: 100%; }
+body { font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+

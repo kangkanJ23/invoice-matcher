@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+openai
+pdfminer.six
+pytesseract
+Pillow
+sqlmodel
+aiofiles
+requests
+python-multipart
+reportlab
+pytest
+python-jose[cryptography]
+boto3
