@@ -31,3 +31,9 @@ build/
 .idea/
 .DS_Store
 Thumbs.db
+venv/
+invoice_matcher.db
+uploads/
+.env
+*.db
+*.sqlite
